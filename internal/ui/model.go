@@ -194,8 +194,8 @@ func (m *Model) initNewProjectForm() {
 	inputs[0].CharLimit = 50
 
 	inputs[1] = textinput.New()
-	inputs[1].Placeholder = "Absolute Path (e.g. C:\\projects\\workspace1)"
-	inputs[1].CharLimit = 150
+	inputs[1].Placeholder = "Path or URL (e.g. C:\\projects\\workspace or https://mcp.website.com/mcp)"
+	inputs[1].CharLimit = 200
 
 	m.formInputs = inputs
 	m.formFocused = 0
@@ -269,13 +269,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.detailsMsg = "Failed to copy: " + err.Error()
 					}
 				}
+			case "m", "M":
+				url := m.pm.GetPublicURL(m.selectedProject.Name)
+				if url != "" {
+					targetMCP := url + "/mcp"
+					if err := copyToClipboard(targetMCP); err == nil {
+						m.detailsMsg = "Copied MCP Stream URL to clipboard!"
+					} else {
+						m.detailsMsg = "Failed to copy: " + err.Error()
+					}
+				}
 			case "c", "C":
 				url := m.pm.GetPublicURL(m.selectedProject.Name)
 				if url != "" {
 					adminToken, _ := config.GetSecret("admin_token")
 					targetSSE := url + "/sse?token=" + adminToken
 					if err := copyToClipboard(targetSSE); err == nil {
-						m.detailsMsg = "Copied Claude URL to clipboard!"
+						m.detailsMsg = "Copied Claude SSE URL to clipboard!"
+					} else {
+						m.detailsMsg = "Failed to copy: " + err.Error()
+					}
+				}
+			case "s", "S":
+				url := m.pm.GetPublicURL(m.selectedProject.Name)
+				if url != "" {
+					adminToken, _ := config.GetSecret("admin_token")
+					targetMCP := url + "/mcp?token=" + adminToken
+					if err := copyToClipboard(targetMCP); err == nil {
+						m.detailsMsg = "Copied Claude Stream URL to clipboard!"
 					} else {
 						m.detailsMsg = "Failed to copy: " + err.Error()
 					}
@@ -297,6 +318,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else {
 						m.detailsMsg = "Failed to copy: " + err.Error()
 					}
+				}
+			case "p", "P":
+				if err := copyToClipboard(m.selectedProject.Path); err == nil {
+					m.detailsMsg = "Copied Configured Path/URL to clipboard!"
+				} else {
+					m.detailsMsg = "Failed to copy: " + err.Error()
 				}
 			case "v", "V":
 				m.revealToken = !m.revealToken
@@ -494,7 +521,11 @@ func (m Model) detailsView() string {
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("Local Workspace Path : %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("#F1FA8C")).Render(p.Path)))
+	pathLabel := "Local Workspace Path "
+	if strings.HasPrefix(p.Path, "http://") || strings.HasPrefix(p.Path, "https://") {
+		pathLabel = "Remote MCP Server URL"
+	}
+	b.WriteString(fmt.Sprintf("%s : %s\n", pathLabel, lipgloss.NewStyle().Foreground(lipgloss.Color("#F1FA8C")).Render(p.Path)))
 	b.WriteString(fmt.Sprintf("Secure Tunnel Type   : %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("#BD93F9")).Render(p.TunnelType)))
 	b.WriteString(fmt.Sprintf("Status               : %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color(statusColor)).Bold(true).Render(status)))
 
@@ -513,7 +544,9 @@ func (m Model) detailsView() string {
 		b.WriteString(fmt.Sprintf("  2. Select Connection Type: %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("#50FA7B")).Render("SSE")))
 		
 		targetSSE := url + "/sse"
-		b.WriteString(fmt.Sprintf("  3. Set Server URL        : %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("#8BE9FD")).Render(targetSSE)))
+		targetMCP := url + "/mcp"
+		b.WriteString(fmt.Sprintf("  3. Set Server URL (SSE)  : %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("#8BE9FD")).Render(targetSSE)))
+		b.WriteString(fmt.Sprintf("     Set Server URL (MCP)  : %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("#8BE9FD")).Render(targetMCP)))
 		b.WriteString("  4. Set Auth Type         : Choose 'Header-based / Custom Header' or 'Bearer Token'\n")
 		b.WriteString("     • If using Header-based / Custom Header:\n")
 		b.WriteString(fmt.Sprintf("       Header Name         : %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("#F1FA8C")).Render("Authorization")))
@@ -526,17 +559,21 @@ func (m Model) detailsView() string {
 		b.WriteString("  1. In Claude, go to Settings -> Connectors -> Add custom connector\n")
 		b.WriteString(fmt.Sprintf("  2. Set Name              : %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("#50FA7B")).Render(p.Name)))
 		b.WriteString(fmt.Sprintf("  3. Set Remote MCP URL    : %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("#8BE9FD")).Render(targetSSE+"?token="+displayToken)))
+		b.WriteString(fmt.Sprintf("     Or Remote Stream URL  : %s\n", lipgloss.NewStyle().Foreground(lipgloss.Color("#8BE9FD")).Render(targetMCP+"?token="+displayToken)))
 		b.WriteString("  4. Click 'Add' (Leave OAuth settings blank)\n")
 	}
 
 
 	b.WriteString("\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#BD93F9")).Bold(true).Render("Controls:") + "\n")
+	b.WriteString("  [P]     Copy Configured local Path / remote URL to Clipboard\n")
 	if url == "" {
 		b.WriteString("  [Enter] Start Project Proxy & Tunnel\n")
 	} else {
 		b.WriteString("  [Enter] Stop Project Proxy & Tunnel\n")
 		b.WriteString("  [U]     Copy SSE URL to Clipboard\n")
-		b.WriteString("  [C]     Copy Claude URL (with token) to Clipboard\n")
+		b.WriteString("  [M]     Copy MCP Stream URL to Clipboard\n")
+		b.WriteString("  [C]     Copy Claude SSE URL (with token) to Clipboard\n")
+		b.WriteString("  [S]     Copy Claude Stream URL (with token) to Clipboard\n")
 		b.WriteString("  [T]     Copy Bearer Token to Clipboard\n")
 		b.WriteString("  [H]     Copy Authorization Header to Clipboard\n")
 		b.WriteString("  [V]     Toggle Token Visibility\n")
@@ -553,7 +590,7 @@ func (m Model) detailsView() string {
 func (m Model) newProjectView() string {
 	var b strings.Builder
 
-	labels := []string{"1. Project Name               : ", "2. Local Path                 : "}
+	labels := []string{"1. Project Name               : ", "2. Path or Remote URL         : "}
 	for i := range m.formInputs {
 		label := labels[i]
 		if i == m.formFocused {

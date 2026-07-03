@@ -128,24 +128,38 @@ func (pm *ProcessManager) StartProject(project config.ProjectConfig) (string, er
 	FreePort(3000)
 	FreePort(8000)
 
+	isRemote := strings.HasPrefix(project.Path, "http://") || strings.HasPrefix(project.Path, "https://")
+
 	// 2. Start MCP proxy process
 	var proxyCmd *exec.Cmd
 
-	if runtime.GOOS == "windows" {
-		proxyCmd = runCmd(project.Path, "npx", "-y", "mcp-proxy", "--port", "3000", "--", "cmd.exe", "/c", "npx", "-y", "@wonderwhy-er/desktop-commander")
-	} else {
-		proxyCmd = runCmd(project.Path, "npx", "-y", "mcp-proxy", "--port", "3000", "--", "npx", "-y", "@wonderwhy-er/desktop-commander")
+	if !isRemote {
+		if runtime.GOOS == "windows" {
+			proxyCmd = runCmd(project.Path, "npx", "-y", "mcp-proxy", "--port", "3000", "--", "cmd.exe", "/c", "npx", "-y", "@wonderwhy-er/desktop-commander")
+		} else {
+			proxyCmd = runCmd(project.Path, "npx", "-y", "mcp-proxy", "--port", "3000", "--", "npx", "-y", "@wonderwhy-er/desktop-commander")
+		}
+
+		if err := proxyCmd.Start(); err != nil {
+			return "", fmt.Errorf("failed to start unified MCP proxy: %w", err)
+		}
+		safe.Go(func() {
+			_ = proxyCmd.Wait()
+		})
 	}
 
-	if err := proxyCmd.Start(); err != nil {
-		return "", fmt.Errorf("failed to start unified MCP proxy: %w", err)
+	killProxy := func() {
+		if proxyCmd != nil {
+			killProcessTree(proxyCmd.Process)
+		}
 	}
-	safe.Go(func() {
-		_ = proxyCmd.Wait()
-	})
 
 	// 3. Start Auth Gateway
-	router := gateway.NewMCPRouter(adminToken)
+	targetURL := "http://127.0.0.1:3000"
+	if isRemote {
+		targetURL = project.Path
+	}
+	router := gateway.NewMCPRouter(adminToken, targetURL)
 	gwServer := &http.Server{
 		Addr:    ":8000",
 		Handler: router,
@@ -199,7 +213,7 @@ func (pm *ProcessManager) StartProject(project config.ProjectConfig) (string, er
 
 	ngrokPath, cfPath, err := installer.GetBinaryPaths()
 	if err != nil {
-		killProcessTree(proxyCmd.Process)
+		killProxy()
 		_ = gwServer.Close()
 		return "", fmt.Errorf("failed to resolve tunnel paths: %w", err)
 	}
@@ -210,13 +224,13 @@ func (pm *ProcessManager) StartProject(project config.ProjectConfig) (string, er
 
 		stdoutPipe, err := tunnelCmd.StdoutPipe()
 		if err != nil {
-			killProcessTree(proxyCmd.Process)
+			killProxy()
 			_ = gwServer.Close()
 			return "", err
 		}
 
 		if err := tunnelCmd.Start(); err != nil {
-			killProcessTree(proxyCmd.Process)
+			killProxy()
 			_ = gwServer.Close()
 			return "", fmt.Errorf("failed to start ngrok: %w", err)
 		}
@@ -249,7 +263,7 @@ func (pm *ProcessManager) StartProject(project config.ProjectConfig) (string, er
 			if err == nil && val != "" {
 				publicURL = val
 			} else {
-				killProcessTree(proxyCmd.Process)
+				killProxy()
 				_ = gwServer.Close()
 				killProcessTree(tunnelCmd.Process)
 				return "", fmt.Errorf("ngrok did not provide a public URL")
@@ -260,13 +274,13 @@ func (pm *ProcessManager) StartProject(project config.ProjectConfig) (string, er
 		tunnelCmd = exec.Command(cfPath, "tunnel", "--url", "http://localhost:8000")
 		stderrPipe, err := tunnelCmd.StderrPipe()
 		if err != nil {
-			killProcessTree(proxyCmd.Process)
+			killProxy()
 			_ = gwServer.Close()
 			return "", err
 		}
 
 		if err := tunnelCmd.Start(); err != nil {
-			killProcessTree(proxyCmd.Process)
+			killProxy()
 			_ = gwServer.Close()
 			return "", fmt.Errorf("failed to start cloudflared: %w", err)
 		}
@@ -299,7 +313,7 @@ func (pm *ProcessManager) StartProject(project config.ProjectConfig) (string, er
 		case urlVal := <-urlChan:
 			publicURL = urlVal
 		case <-time.After(15 * time.Second):
-			killProcessTree(proxyCmd.Process)
+			killProxy()
 			_ = gwServer.Close()
 			killProcessTree(tunnelCmd.Process)
 			return "", fmt.Errorf("cloudflared did not provide a public URL")
@@ -392,23 +406,26 @@ func (pm *ProcessManager) startWatchdog(projectName string, project config.Proje
 
 			// 1. Monitor ProxyCmd (mcp-proxy)
 			needProxyRestart := false
-			if proc.ProxyCmd != nil && proc.ProxyCmd.ProcessState != nil {
-				// Proxy exited
-				fmt.Printf("[watchdog] Proxy process exited. Restarting...\n")
-				needProxyRestart = true
-			} else if time.Since(startTime) > 15*time.Second {
-				// Check if port is responding (only after startup grace period)
-				if !isPortOpen("127.0.0.1:3000") {
-					unresponsiveCount++
-					fmt.Printf("[watchdog] Proxy port 3000 unresponsive count: %d/3\n", unresponsiveCount)
-					if unresponsiveCount >= 3 {
-						fmt.Printf("[watchdog] Proxy port 3000 unresponsive for 15 seconds. Restarting...\n")
-						needProxyRestart = true
+			isRemote := strings.HasPrefix(project.Path, "http://") || strings.HasPrefix(project.Path, "https://")
+			if !isRemote {
+				if proc.ProxyCmd != nil && proc.ProxyCmd.ProcessState != nil {
+					// Proxy exited
+					fmt.Printf("[watchdog] Proxy process exited. Restarting...\n")
+					needProxyRestart = true
+				} else if time.Since(startTime) > 15*time.Second {
+					// Check if port is responding (only after startup grace period)
+					if !isPortOpen("127.0.0.1:3000") {
+						unresponsiveCount++
+						fmt.Printf("[watchdog] Proxy port 3000 unresponsive count: %d/3\n", unresponsiveCount)
+						if unresponsiveCount >= 3 {
+							fmt.Printf("[watchdog] Proxy port 3000 unresponsive for 15 seconds. Restarting...\n")
+							needProxyRestart = true
+						}
+					} else {
+						unresponsiveCount = 0
+						// Reset proxy failure count if it was successfully running & responsive
+						consecutiveProxyRestarts = 0
 					}
-				} else {
-					unresponsiveCount = 0
-					// Reset proxy failure count if it was successfully running & responsive
-					consecutiveProxyRestarts = 0
 				}
 			}
 

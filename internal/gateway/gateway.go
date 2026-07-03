@@ -20,12 +20,28 @@ import (
 
 type MCPRouter struct {
 	AdminToken string
+	TargetURL  string
 	proxy      *httputil.ReverseProxy
 }
 
-func NewMCPRouter(adminToken string) *MCPRouter {
-	target, _ := url.Parse("http://127.0.0.1:3000")
+func NewMCPRouter(adminToken string, targetURL string) *MCPRouter {
+	target, _ := url.Parse(targetURL)
 	proxy := httputil.NewSingleHostReverseProxy(target)
+
+	// Wrap original Director to set Host (essential for TLS SNI) and prevent path duplication.
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		req.Host = target.Host
+
+		targetPath := strings.TrimSuffix(target.Path, "/")
+		if targetPath != "" {
+			doublePrefix := targetPath + targetPath
+			if strings.HasPrefix(req.URL.Path, doublePrefix) {
+				req.URL.Path = strings.TrimPrefix(req.URL.Path, targetPath)
+			}
+		}
+	}
 
 	// Optimize Transport connection pool, add a connection retry dialer, and disable response timeout for SSE streams
 	proxy.Transport = &http.Transport{
@@ -83,6 +99,7 @@ func NewMCPRouter(adminToken string) *MCPRouter {
 
 	return &MCPRouter{
 		AdminToken: adminToken,
+		TargetURL:  targetURL,
 		proxy:      proxy,
 	}
 }
@@ -96,6 +113,35 @@ func (r *MCPRouter) DiscoverTools() error {
 	return nil
 }
 
+// getUpstreamURL resolves the final upstream SSE URL, copying query parameters from request (excluding token)
+func (router *MCPRouter) getUpstreamURL(r *http.Request) string {
+	target, err := url.Parse(router.TargetURL)
+	if err != nil {
+		return router.TargetURL
+	}
+
+	var upstream *url.URL
+	if target.Path != "" && target.Path != "/" {
+		uCopy := *target
+		upstream = &uCopy
+	} else {
+		upstream = target.ResolveReference(&url.URL{Path: "/sse"})
+	}
+
+	q := r.URL.Query()
+	q.Del("token")
+
+	targetQ := target.Query()
+	for k, vs := range targetQ {
+		for _, v := range vs {
+			q.Add(k, v)
+		}
+	}
+
+	upstream.RawQuery = q.Encode()
+	return upstream.String()
+}
+
 // handleSSEKeepalive proxies the SSE connection and sends a comment ping every 15s
 // to prevent ngrok / reverse proxies from closing idle connections.
 func (router *MCPRouter) handleSSEKeepalive(w http.ResponseWriter, r *http.Request, token string) {
@@ -107,7 +153,7 @@ func (router *MCPRouter) handleSSEKeepalive(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Open connection to upstream SSE
-	upstreamURL := "http://127.0.0.1:3000" + r.URL.RequestURI()
+	upstreamURL := router.getUpstreamURL(r)
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, nil)
 	if err != nil {
 		http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
@@ -183,6 +229,18 @@ func (router *MCPRouter) handleSSEKeepalive(w http.ResponseWriter, r *http.Reque
 				trimmed := strings.TrimRight(line, "\r\n")
 				suffix := line[len(trimmed):]
 				uri := strings.TrimPrefix(trimmed, "data: ")
+
+				// Handle absolute URLs by converting them to relative path to route through our gateway
+				if u, err := url.Parse(uri); err == nil {
+					if u.Scheme == "http" || u.Scheme == "https" {
+						pathAndQuery := u.Path
+						if u.RawQuery != "" {
+							pathAndQuery += "?" + u.RawQuery
+						}
+						uri = pathAndQuery
+					}
+				}
+
 				if strings.HasPrefix(uri, "/") {
 					if strings.Contains(uri, "?") {
 						uri += "&token=" + token

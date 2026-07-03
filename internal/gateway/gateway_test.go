@@ -11,7 +11,7 @@ import (
 
 func TestServeHTTP_Auth(t *testing.T) {
 	adminToken := "test-token-123"
-	router := NewMCPRouter(adminToken)
+	router := NewMCPRouter(adminToken, "http://127.0.0.1:3000")
 
 	// Case 1: Missing token (should return 401)
 	req := httptest.NewRequest("GET", "/sse", nil)
@@ -78,7 +78,7 @@ func TestSSEKeepalive_Rewrite(t *testing.T) {
 	// Wait a moment for server to start
 	time.Sleep(100 * time.Millisecond)
 
-	router := NewMCPRouter(adminToken)
+	router := NewMCPRouter(adminToken, "http://127.0.0.1:3000")
 
 	req := httptest.NewRequest("GET", "/sse?token="+adminToken, nil)
 	rr := httptest.NewRecorder()
@@ -94,5 +94,30 @@ func TestSSEKeepalive_Rewrite(t *testing.T) {
 	expected := "data: /message?session_id=abcdef123456&token=test-token-123\n"
 	if !strings.Contains(body, expected) {
 		t.Errorf("Expected body to contain modified endpoint line %q, got: %q", expected, body)
+	}
+}
+
+func TestRemoteURLRouting(t *testing.T) {
+	adminToken := "test-token-123"
+	targetURL := "https://mcp.website.com/mcp"
+	router := NewMCPRouter(adminToken, targetURL)
+
+	// Test 1: getUpstreamURL logic
+	req := httptest.NewRequest("GET", "/sse?token="+adminToken+"&session=abc", nil)
+	resolved := router.getUpstreamURL(req)
+	expectedURL := "https://mcp.website.com/mcp?session=abc"
+	if resolved != expectedURL {
+		t.Errorf("Expected upstream URL %q, got %q", expectedURL, resolved)
+	}
+
+	// Test 2: Director rewrites request Host and path duplication
+	proxyReq := httptest.NewRequest("POST", "/mcp/session/123", nil)
+	router.proxy.Director(proxyReq)
+
+	if proxyReq.Host != "mcp.website.com" {
+		t.Errorf("Expected Host header %q, got %q", "mcp.website.com", proxyReq.Host)
+	}
+	if proxyReq.URL.Path != "/mcp/session/123" {
+		t.Errorf("Expected Path %q, got %q", "/mcp/session/123", proxyReq.URL.Path)
 	}
 }
